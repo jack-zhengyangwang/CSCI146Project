@@ -14,50 +14,132 @@ import torch
 from torch.distributions import Categorical
 from typing import List
 
-# Download latest version
-path = kagglehub.dataset_download("visualize25/valorant-pro-matches-full-data")
-
-print("Path to dataset files:", path)
 # %% Read the dataset
+from inspect_db import load_all_data, inspect_database
 
-# Use the path from kagglehub
-db_path = os.path.join(path, "valorant.sqlite")
-print("DB path:", db_path)
+# Load all data from database
+games, rounds, scoreboard, matches = load_all_data()
 
-conn = sqlite3.connect(db_path)
+# Inspect the loaded data
+inspect_database(games, rounds, scoreboard, matches)
 
-games      = pd.read_sql_query("SELECT * FROM Games", conn)
-rounds     = pd.read_sql_query("SELECT * FROM Game_Rounds", conn)
-scoreboard = pd.read_sql_query("SELECT * FROM Game_Scoreboard", conn)
-matches    = pd.read_sql_query("SELECT * FROM Matches", conn)
+# %% Clean rounds data
+from clean_rounds import clean_rounds_data, show_sample_cleaned_data
 
-conn.close()
+# Clean the rounds data - extract RoundHistory into separate rows (one row per round)
+rounds_cleaned = clean_rounds_data(rounds, games)
 
-print("Games columns:", games.columns.tolist())
-# %% Create model
-games_model = games.copy()
+# Show sample of cleaned data
+show_sample_cleaned_data(rounds_cleaned, n_games=1)
 
-# y = 1 if Team1 wins, else 0
-games_model["y"] = (games_model["Winner"] == games_model["Team1"]).astype(int)
-# %% Create feature
-feature_cols = [
-    "Team1_TotalRounds",
-    "Team2_TotalRounds",
-    "Team1_PistolWon",
-    "Team2_PistolWon",
-    "Team1_Eco",
-    "Team2_Eco",
-    "Team1_SemiBuy",
-    "Team2_SemiBuy",
-    "Team1_FullBuy",
-    "Team2_FullBuy",
+# %% Compute score difference
+# Calculate score difference: Team1Score - Team2Score
+rounds_cleaned['ScoreDifference'] = rounds_cleaned['Team1Score'] - rounds_cleaned['Team2Score']
+
+# %% Prepare features for logistic regression (round-level prediction)
+# Goal: Predict if Team1 wins the round
+
+# Create additional features
+# 1. Bank difference (economic advantage)
+rounds_cleaned['BankDifference'] = rounds_cleaned['Team1Bank'] - rounds_cleaned['Team2Bank']
+
+# 2. Encode buy types as binary indicators (one-hot style)
+# Team1 buy types
+rounds_cleaned['Team1_IsEco'] = rounds_cleaned['Team1BuyType'].str.lower().str.contains('eco', na=False).astype(int)
+rounds_cleaned['Team1_IsSemi'] = rounds_cleaned['Team1BuyType'].str.lower().str.contains('semi', na=False).astype(int)
+rounds_cleaned['Team1_IsFull'] = rounds_cleaned['Team1BuyType'].str.lower().str.contains('full', na=False).astype(int)
+
+# Team2 buy types
+rounds_cleaned['Team2_IsEco'] = rounds_cleaned['Team2BuyType'].str.lower().str.contains('eco', na=False).astype(int)
+rounds_cleaned['Team2_IsSemi'] = rounds_cleaned['Team2BuyType'].str.lower().str.contains('semi', na=False).astype(int)
+rounds_cleaned['Team2_IsFull'] = rounds_cleaned['Team2BuyType'].str.lower().str.contains('full', na=False).astype(int)
+
+# 3. Game phase indicators
+rounds_cleaned['IsEarlyGame'] = (rounds_cleaned['RoundNumber'] <= 6).astype(int)
+rounds_cleaned['IsMidGame'] = ((rounds_cleaned['RoundNumber'] > 6) & (rounds_cleaned['RoundNumber'] <= 12)).astype(int)
+rounds_cleaned['IsLateGame'] = (rounds_cleaned['RoundNumber'] > 12).astype(int)
+
+# 4. Create target variable: 1 if Team1 wins the round, 0 if Team2 wins
+# We need to determine which team won from RoundWinner
+def get_team1_win(row):
+    """
+    Convert RoundWinner abbreviation to binary target.
+    
+    RoundWinner is like "BOOS" or "PHO " (team abbreviations)
+    We need to match it to Team1's name to create binary: 1 = Team1 won, 0 = Team2 won
+    """
+    if pd.isna(row['RoundWinner']):
+        return None
+    round_winner = str(row['RoundWinner']).strip().upper()
+    team1_name = str(row.get('Team1', '')).strip() if pd.notna(row.get('Team1')) else ''
+    
+    if team1_name:
+        # Create abbreviation from team name (first letters of each word)
+        team1_abbrev = ''.join([w[0] for w in team1_name.split()]).upper()[:4]
+        if round_winner.startswith(team1_abbrev) or team1_abbrev.startswith(round_winner):
+            return 1
+    return 0
+
+rounds_cleaned['Team1_WinsRound'] = rounds_cleaned.apply(get_team1_win, axis=1)
+
+# Recommended feature columns for round-level prediction:
+round_feature_cols = [
+    # Score information (most important)
+    'ScoreDifference',           # Current score advantage
+    
+    # Economic information
+    'BankDifference',            # Economic advantage (Team1Bank - Team2Bank)
+
+    
+    # Buy type indicators
+    'Team1_IsEco',              # Team1 eco round
+    'Team1_IsFull',             # Team1 full buy
+    'Team2_IsEco',              # Team2 eco round
+    'Team2_IsFull',             # Team2 full buy
+    
+    # Game phase
+    'RoundNumber',              # Round number
+    'IsEarlyGame',              # Early game indicator
+    'IsMidGame',                # Mid game indicator
+    'IsLateGame',               # Late game indicator
 ]
 
-# Drop rows with missing values in these features
-games_model = games_model.dropna(subset=feature_cols + ["y"])
+print("\n=== Recommended Features for Round-Level Logistic Regression ===")
+print("Features to predict: Team1_WinsRound (1 = Team1 wins, 0 = Team2 wins)")
+print(f"\nSelected {len(round_feature_cols)} features:")
+for i, feat in enumerate(round_feature_cols, 1):
+    print(f"  {i:2d}. {feat}")
 
-X = games_model[feature_cols]
-y = games_model["y"]
+# %% Create model for round-level prediction
+# Use cleaned rounds data with round-level features
+rounds_model = rounds_cleaned.copy()
+
+# Prepare features and target
+# Drop rows with missing values in features or target
+print("\n=== Preparing Data for Model ===")
+print(f"Initial rows: {len(rounds_model)}")
+
+# Check which features exist and drop rows with missing values
+available_features = [f for f in round_feature_cols if f in rounds_model.columns]
+missing_features = [f for f in round_feature_cols if f not in rounds_model.columns]
+
+if missing_features:
+    print(f"Warning: Missing features: {missing_features}")
+    print(f"Using available features: {available_features}")
+
+rounds_model = rounds_model.dropna(subset=available_features + ['Team1_WinsRound'])
+
+print(f"Rows after dropping missing values: {len(rounds_model)}")
+print(f"Target distribution:")
+print(rounds_model['Team1_WinsRound'].value_counts())
+
+# Split into features and target
+X = rounds_model[available_features]
+y = rounds_model['Team1_WinsRound']
+
+print(f"\nFeature matrix shape: {X.shape}")
+print(f"Target shape: {y.shape}")
+
 # %% Split data
 X_train, X_test, y_train, y_test = train_test_split(
     X, y, test_size=0.2, random_state=42, stratify=y
@@ -66,16 +148,34 @@ X_train, X_test, y_train, y_test = train_test_split(
 # %% Train model
 scaler = StandardScaler()
 X_train_scaled = scaler.fit_transform(X_train)
-X_test_scaled  = scaler.transform(X_test)
+X_test_scaled = scaler.transform(X_test)
+
 # %% Run Logistic regression
-logit = LogisticRegression(max_iter=2000)
+print("\n=== Training Logistic Regression Model ===")
+logit = LogisticRegression(max_iter=2000, random_state=42)
 logit.fit(X_train_scaled, y_train)
+
+# Store feature names for environment
+LOGIT_FEATURE_NAMES = available_features.copy()
+
 # %% Create prediction and measure accuracy
 y_pred = logit.predict(X_test_scaled)
 acc = accuracy_score(y_test, y_pred)
 
-print("Logistic Regression Accuracy:", acc)
+print("\n=== Model Results ===")
+print(f"Accuracy: {acc:.4f}")
+print("\nClassification Report:")
 print(classification_report(y_test, y_pred))
+
+# Show feature importance (coefficients)
+print("\n=== Feature Importance (Coefficients) ===")
+feature_importance = pd.DataFrame({
+    'Feature': available_features,
+    'Coefficient': logit.coef_[0]
+}).sort_values('Coefficient', ascending=False)
+
+print(feature_importance.to_string(index=False))
+
 #%% Team 2 policy
 ACTION_ID_TO_NAME = {
     0: "eco",
@@ -96,11 +196,11 @@ def sample_action_from_probs(action_ids, probs, rng=None):
 def team2_policy_aggressive(team2_bank, rng=None):
     """
     Aggressive:
-      - If bank >= 20000: always FULL
+      - If bank >= 21000 (5 * 4200): always FULL
       - Else if bank >= 10000: SEMI (still spending)
       - Else: ECO
     """
-    if team2_bank >= 5 * 4200:
+    if team2_bank >= 5 * 4200:  # 21000
         action_id = 2  # full
     elif team2_bank >= 10000:
         action_id = 1  # semi
@@ -112,10 +212,10 @@ def team2_policy_aggressive(team2_bank, rng=None):
 def team2_policy_middle(team2_bank, rng=None):
     """
     Middle / balanced strategy:
-      - If bank >= 20000: [eco 0.3, semi 0.4, full 0.3]
-      - If 10000 <= bank < 20000: [eco 0.5, semi 0.5, full 0]
+      - If bank >= 21000 (5 * 4200): [eco 0.3, semi 0.4, full 0.3]
+      - If 10000 <= bank < 21000: [eco 0.5, semi 0.5, full 0]
       - If bank < 10000: [eco 1, semi 0, full 0]
-        """
+    """
     action_ids = [0, 1, 2]
 
     if team2_bank >= 5 * 4200:
@@ -131,9 +231,9 @@ def team2_policy_middle(team2_bank, rng=None):
 def team2_policy_conservative(team2_bank, rng=None):
     """
     Conservative:
-      - If bank >= 25000: FULL
-      - If 15000 <= bank < 25000: SEMI
-      - If bank < 15000: ECO
+      - If bank >= 30000: FULL
+      - If 21000 (5 * 4200) <= bank < 30000: SEMI
+      - If bank < 21000: ECO
     """
     if team2_bank >= 30000:
         action_id = 2  # full
@@ -219,11 +319,21 @@ class ValorantEnv:
         team2_policy=team2_policy_aggressive,  # default
         max_rounds=24,
         rng_seed=10086,
+        logit_model=None,  # Trained logistic regression model
+        scaler=None,       # Scaler used for features
+        feature_names=None,  # List of feature names in order
+        econ_weight=0.0,     # Weight for economic discount (0 = no discount, higher = more penalty for spending)
+        round_weight=1.0,    # Weight for round number importance (1.0 = all rounds equal, >1.0 = later rounds matter more)
     ):
         self.team1_bank_init = team1_bank_init
         self.team2_bank_init = team2_bank_init
         self.team2_policy    = team2_policy
         self.max_rounds      = max_rounds
+        self.logit_model     = logit_model
+        self.scaler          = scaler
+        self.feature_names   = feature_names
+        self.econ_weight     = econ_weight  # Controls penalty for spending money
+        self.round_weight    = round_weight  # Controls importance of later rounds
 
         self.rng = np.random.default_rng(rng_seed)
 
@@ -251,6 +361,58 @@ class ValorantEnv:
         return state
 
 
+    def _state_to_features(self, state, action1, action2):
+        """
+        Convert current state and actions to feature vector for logistic regression.
+        
+        Args:
+            state: Current state dictionary
+            action1: Team1's action (0=eco, 1=semi, 2=full)
+            action2: Team2's action (0=eco, 1=semi, 2=full)
+        
+        Returns:
+            Feature vector as numpy array
+        """
+        features = {}
+        
+        # Score information
+        features['ScoreDifference'] = state['team1_score'] - state['team2_score']
+        
+        # Economic information
+        features['BankDifference'] = state['team1_bank'] - state['team2_bank']
+        
+        # Buy type indicators
+        features['Team1_IsEco'] = 1 if action1 == 0 else 0
+        features['Team1_IsFull'] = 1 if action1 == 2 else 0
+        features['Team2_IsEco'] = 1 if action2 == 0 else 0
+        features['Team2_IsFull'] = 1 if action2 == 2 else 0
+        
+        # Game phase
+        features['RoundNumber'] = state['round_number']
+        features['IsEarlyGame'] = 1 if state['round_number'] <= 6 else 0
+        features['IsMidGame'] = 1 if 6 < state['round_number'] <= 12 else 0
+        features['IsLateGame'] = 1 if state['round_number'] > 12 else 0
+        
+        # Convert to array in the same order as feature_names
+        if self.feature_names:
+            feature_vector = np.array([features.get(feat, 0) for feat in self.feature_names])
+        else:
+            # Fallback: use order from available_features
+            feature_vector = np.array([
+                features['ScoreDifference'],
+                features['BankDifference'],
+                features['Team1_IsEco'],
+                features['Team1_IsFull'],
+                features['Team2_IsEco'],
+                features['Team2_IsFull'],
+                features['RoundNumber'],
+                features['IsEarlyGame'],
+                features['IsMidGame'],
+                features['IsLateGame'],
+            ])
+        
+        return feature_vector
+
     def step(self, action1):
 
         # -------------------------
@@ -259,16 +421,57 @@ class ValorantEnv:
         action2, action2_name = self.team2_policy(self.team2_bank, rng=self.rng)
 
         # -------------------------
-        # 2. Determine round outcome
-        # TODO: replace with logistic model later
+        # 2. Determine round outcome using logistic regression
         # -------------------------
-        team1_wins = self.rng.random() < 0.5
+        if self.logit_model is not None and self.scaler is not None:
+            # Get current state
+            current_state = {
+                'round_number': self.round_number,
+                'team1_bank': self.team1_bank,
+                'team2_bank': self.team2_bank,
+                'team1_score': self.team1_score,
+                'team2_score': self.team2_score,
+            }
+            
+            # Convert state to features
+            feature_vector = self._state_to_features(current_state, action1, action2)
+            feature_vector = feature_vector.reshape(1, -1)
+            
+            # Scale features
+            feature_vector_scaled = self.scaler.transform(feature_vector)
+            
+            # Predict probability that Team1 wins
+            prob_team1_wins = self.logit_model.predict_proba(feature_vector_scaled)[0, 1]
+            
+            # Sample outcome based on probability
+            team1_wins = self.rng.random() < prob_team1_wins
+        else:
+            team1_wins = self.rng.random() < 0.5
 
         outcome1 = "win"  if team1_wins else "loss"
         outcome2 = "loss" if team1_wins else "win"
 
-        # RL reward
-        reward = 1 if outcome1 == "win" else 0
+        # Calculate RL reward with economic and round number weighting
+        base_reward = 1.0 if outcome1 == "win" else 0.0
+        
+        # Economic discount: penalize spending money
+        # Higher econ_weight means spending more reduces reward
+        team1_spend = BUY_COST_TEAM[action1]
+        # Normalize spend by max possible spend (full buy = 21000)
+        normalized_spend = team1_spend / BUY_COST_TEAM[2]  # Divide by full buy cost
+        econ_penalty = self.econ_weight * normalized_spend
+        
+        # Round number weighting: later rounds matter more
+        # Normalize round number (1 to max_rounds) to [0, 1] range
+        normalized_round = (self.round_number - 1) / (self.max_rounds - 1) if self.max_rounds > 1 else 0
+        # Apply round weight: 1.0 = all rounds equal, >1.0 = later rounds amplified
+        round_multiplier = 1.0 + (self.round_weight - 1.0) * normalized_round
+        
+        # Final reward: base reward * round multiplier - economic penalty
+        reward = base_reward * round_multiplier - econ_penalty
+        
+        # Ensure reward is non-negative (optional, can remove if negative rewards are desired)
+        reward = max(reward, 0.0)
 
         # -------------------------
         # 3. Update score
@@ -328,9 +531,44 @@ class ValorantEnv:
         }
 
         return next_state, reward, done, info
+# %% ============================================================
+# REINFORCEMENT LEARNING SETUP
+# ============================================================
+print("\n" + "="*60)
+print("REINFORCEMENT LEARNING SETUP")
+print("="*60)
+
+# %% Step 1: Create Environment with Trained Logistic Regression Model
+print("\n--- Step 1: Creating Environment ---")
+
+# Create environment with the trained logistic regression model
+env = ValorantEnv(
+    team1_bank_init=4000.0,
+    team2_bank_init=4000.0,
+    team2_policy=team2_policy_aggressive,  # Fixed Team2 policy
+    max_rounds=24,
+    rng_seed=42,
+    logit_model=logit,                    # Use trained model for round prediction
+    scaler=scaler,                        # Use same scaler
+    feature_names=LOGIT_FEATURE_NAMES,    # Use exact feature names from training
+    econ_weight=0.0,                      # Economic penalty weight (0 = no penalty)
+    round_weight=1.0,                     # Round importance weight (1.0 = all equal)
+)
+
+print("✓ Environment created with logistic regression model")
+print(f"  - Team2 Policy: aggressive")
+print(f"  - Economic weight: {env.econ_weight}")
+print(f"  - Round weight: {env.round_weight}")
+
+# Test environment reset
+test_state = env.reset()
+print(f"\n✓ Environment reset successful")
+print(f"  Initial state keys: {list(test_state.keys())}")
+print(f"  Initial state: round={test_state['round_number']}, "
+      f"Team1 bank={test_state['team1_bank']}, Team2 bank={test_state['team2_bank']}")
+
 
 # %% Convet State to Tensor
-import torch
 STATE_KEYS = [
     "round_number",
     "team1_bank",
@@ -351,8 +589,25 @@ def state_to_tensor(state: dict) -> torch.Tensor:
         vals.append(float(state[key]))   # ensure numeric
     return torch.tensor(vals, dtype=torch.float32)
 
-# Test
-# state = {
+# Test state_to_tensor function (commented out)
+# print("\n--- Step 2: Testing State to Tensor Conversion ---")
+
+# Test with the actual state from environment
+# test_state = env.reset()
+# print(f"\nTest state from environment:")
+# for key, value in test_state.items():
+#     if key in STATE_KEYS:
+#         print(f"  {key}: {value}")
+
+# Convert to tensor
+# test_tensor = state_to_tensor(test_state)
+# print(f"\n✓ Converted to tensor:")
+# print(f"  Tensor shape: {test_tensor.shape}")
+# print(f"  Tensor values: {test_tensor}")
+# print(f"  Tensor dtype: {test_tensor.dtype}")
+
+# Test with a different state
+# test_state2 = {
 #     "round_number": 4,
 #     "team1_bank": 8000,
 #     "team2_bank": 12000,
@@ -360,8 +615,17 @@ def state_to_tensor(state: dict) -> torch.Tensor:
 #     "team2_losestreak": 0,
 #     "team1_score": 3,
 #     "team2_score": 2,
+#     "team2_action": 2,  # Extra key (should be ignored)
+#     "team2_action_name": "full"  # Extra key (should be ignored)
 # }
-# print(state_to_tensor(state))
+
+# test_tensor2 = state_to_tensor(test_state2)
+# print(f"\n✓ Test with different state:")
+# print(f"  State: round={test_state2['round_number']}, Team1 bank={test_state2['team1_bank']}")
+# print(f"  Tensor: {test_tensor2}")
+
+# print(f"\n✓ State to tensor conversion working correctly!")
+# print(f"  State dimension: {len(STATE_KEYS)} values")
 # %% Create Policy
 class PolicyNet(nn.Module):
     def __init__(self, state_dim: int, action_dim: int):
