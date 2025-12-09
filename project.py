@@ -67,7 +67,7 @@ X_train, X_test, y_train, y_test = train_test_split(
 scaler = StandardScaler()
 X_train_scaled = scaler.fit_transform(X_train)
 X_test_scaled  = scaler.transform(X_test)
-# %% Run Lodistic regression
+# %% Run Logistic regression
 logit = LogisticRegression(max_iter=2000)
 logit.fit(X_train_scaled, y_train)
 # %% Create prediction and measure accuracy
@@ -468,7 +468,7 @@ def discounted_returns(rewards: List[float], gamma: float = 0.99) -> torch.Tenso
     G.reverse()
     return torch.tensor(G, dtype=torch.float32)
 
-# %%
+# %% Train Model
 def run_one_episode(env: ValorantEnv, policy: PolicyNet):
     """
     Play one full game (episode) using the current policy.
