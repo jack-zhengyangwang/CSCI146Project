@@ -5,6 +5,16 @@ import ast
 import os
 import sqlite3
 import pandas as pd
+import warnings
+
+# Suppress sklearn and other annoying warnings
+warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', module='sklearn')
+# Also suppress deprecation warnings from sklearn
+import sklearn
+warnings.filterwarnings('ignore', category=DeprecationWarning, module='sklearn')
+
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
@@ -568,7 +578,7 @@ print(f"  Initial state: round={test_state['round_number']}, "
       f"Team1 bank={test_state['team1_bank']}, Team2 bank={test_state['team2_bank']}")
 
 
-# %% Convet State to Tensor
+# %% Step 2: Convert State to Tensor
 STATE_KEYS = [
     "round_number",
     "team1_bank",
@@ -626,41 +636,78 @@ def state_to_tensor(state: dict) -> torch.Tensor:
 
 # print(f"\n✓ State to tensor conversion working correctly!")
 # print(f"  State dimension: {len(STATE_KEYS)} values")
-# %% Create Policy
+# %% Step 3: Create Policy Network
+print("\n--- Step 3: Creating Policy Network ---")
+
 class PolicyNet(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int):
+    """
+    Neural network policy that outputs action probabilities.
+    
+    Takes game state (7 values) and outputs probabilities for 3 actions:
+    - Action 0: Eco
+    - Action 1: Semi
+    - Action 2: Full
+    """
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 128):
         super().__init__()
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        
         self.net = nn.Sequential(
-            nn.Linear(state_dim, 128),
+            nn.Linear(state_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(128, action_dim),
-            nn.Softmax(dim=-1),
+            nn.Linear(hidden_dim, action_dim),
+            nn.Softmax(dim=-1),  # Ensures probabilities sum to 1
         )
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         """
-        Input:
-            state: shape [state_dim]
-
-        Output:
-            action probabilities: shape [action_dim], sum to 1
+        Forward pass: state -> action probabilities
+        
+        Args:
+            state: shape [state_dim] or [batch_size, state_dim]
+        
+        Returns:
+            action probabilities: shape [action_dim] or [batch_size, action_dim]
+            Probabilities sum to 1.0
         """
         return self.net(state)
 
-#state_dim = len(STATE_KEYS)
-#action_dim = 3
+# Create policy network
+state_dim = len(STATE_KEYS)  # 7: round, banks, scores, loss streaks
+action_dim = 3  # eco, semi, full
 
-#policy = PolicyNet(state_dim, action_dim)
+policy = PolicyNet(state_dim=state_dim, action_dim=action_dim)
 
-#dummy_state = torch.tensor([1.0, 40000.0, 40000.0, 0.0, 1.0, 3.0, 4.0])
+print(f"✓ Policy network created")
+print(f"  - Input dimension: {state_dim} (state features)")
+print(f"  - Output dimension: {action_dim} (action probabilities)")
+print(f"  - Architecture: {state_dim} -> 128 -> {action_dim}")
 
-# print(policy(dummy_state))
+# Test the policy with a sample state
+print("\n  Testing policy network...")
+test_state_dict = env.reset()
+test_state_tensor = state_to_tensor(test_state_dict)
+test_probs = policy(test_state_tensor)
+
+print(f"  Sample state: {test_state_tensor}")
+print(f"  Action probabilities: {test_probs}")
+print(f"  Probabilities sum: {test_probs.sum().item():.4f} (should be 1.0)")
+print(f"  Most likely action: {test_probs.argmax().item()} ({ACTION_ID_TO_NAME[test_probs.argmax().item()]})")
+
+print("\n✓ Policy network is working correctly!")
 
 
-# %% Run on episode
+# %% Step 4: Test Running One Episode
+print("\n--- Step 4: Testing One Episode ---")
+
 def run_one_episode(env: ValorantEnv, policy: PolicyNet):
     """
     Play one full game (episode) using the current policy.
+    
+    Args:
+        env: ValorantEnv environment
+        policy: PolicyNet neural network
     
     Returns:
         rewards:  list of rewards per step (round)
@@ -698,83 +745,58 @@ def run_one_episode(env: ValorantEnv, policy: PolicyNet):
     total_return = sum(rewards)
     return rewards, logps, total_return
 
-if __name__ == "__main__":
-    # 1. Build environment vs some fixed Team2 strategy
-    env = ValorantEnv(team2_policy=team2_policy_aggressive)
+# Test running one episode
+print("Running one test episode...")
+rewards, logps, total_return = run_one_episode(env, policy)
 
-    # 2. Build randomly initialized policy
-    state_dim = len(STATE_KEYS)
-    action_dim = 3
-    policy = PolicyNet(state_dim, action_dim)
+print(f"\n✓ Episode completed successfully!")
+print(f"  - Number of rounds: {len(rewards)}")
+print(f"  - Total return (sum of rewards): {total_return:.2f}")
+print(f"  - Average reward per round: {total_return/len(rewards):.4f}")
+print(f"  - First 5 rewards: {rewards[:5]}")
+print(f"  - Last 5 rewards: {rewards[-5:]}")
+print(f"  - Number of log-probabilities stored: {len(logps)}")
 
-    # 3. Run one episode
-    rewards, logps, total_return = run_one_episode(env, policy)
+# %% Step 5: Discounted Returns Function
+print("\n--- Step 5: Discounted Returns Function ---")
 
-    print("Number of rounds played:", len(rewards))
-    print("Total return (sum of rewards):", total_return)
-    print("First few rewards:", rewards[:10])
-
-# %% Discounted Return
 def discounted_returns(rewards: List[float], gamma: float = 0.99) -> torch.Tensor:
     """
     Compute discounted returns G_t for a single episode:
-        G_t = r_t + gamma * r_{t+1} + ...
-    Input:
+        G_t = r_t + gamma * r_{t+1} + gamma^2 * r_{t+2} + ...
+    
+    This gives the total future reward from each time step.
+    
+    Args:
         rewards: list of rewards [r_0, ..., r_{T-1}]
-    Output:
-        torch.Tensor of shape [T]
+        gamma: discount factor (0.99 = future rewards matter almost as much as current)
+    
+    Returns:
+        torch.Tensor of shape [T] with discounted returns for each time step
     """
     G = []
     running = 0.0
+    # Work backwards: last reward has no future rewards, first reward sees all future
     for r in reversed(rewards):
         running = r + gamma * running
         G.append(running)
     G.reverse()
     return torch.tensor(G, dtype=torch.float32)
 
-# %% Train Model
-def run_one_episode(env: ValorantEnv, policy: PolicyNet):
-    """
-    Play one full game (episode) using the current policy.
-    
-    Returns:
-        rewards:  list of rewards per step (round)
-        logps:    list of log π(a_t|s_t) per step (PyTorch tensors)
-        total_return: sum of rewards in the episode
-    """
-    state = env.reset()
-    done = False
+# Test discounted returns
+print("Testing discounted returns function...")
+test_rewards = [1.0, 0.0, 1.0, 0.0, 1.0]
+test_returns = discounted_returns(test_rewards, gamma=0.99)
+print(f"  Example rewards: {test_rewards}")
+print(f"  Discounted returns: {test_returns}")
+print(f"  ✓ Discounted returns working correctly!")
 
-    rewards = []
-    logps   = []
-
-    while not done:
-        # 1. Convert state dict -> tensor
-        s_t = state_to_tensor(state)     # shape [state_dim]
-
-        # 2. Get action probs from policy
-        probs = policy(s_t)              # shape [3] = [p_eco, p_semi, p_full]
-
-        # 3. Define a categorical distribution and sample an action
-        dist = Categorical(probs)
-        action = dist.sample()           # scalar {0,1,2}
-        logp = dist.log_prob(action)     # log π(a_t|s_t), scalar tensor
-
-        # 4. Step the environment with Team1's action
-        next_state, reward, done, info = env.step(action.item())
-
-        # 5. Store reward and log-prob
-        rewards.append(float(reward))
-        logps.append(logp)
-
-        # 6. Move to next state
-        state = next_state
-
-    total_return = sum(rewards)
-    return rewards, logps, total_return
+# %% Step 6: Training Function (REINFORCE Algorithm)
+print("\n--- Step 6: REINFORCE Training Function ---")
 
 def train_valorant_agent(
-    team2_policy_fn,
+    env: ValorantEnv,
+    policy: PolicyNet,
     episodes: int = 300,
     gamma: float = 0.99,
     lr: float = 1e-3,
@@ -782,21 +804,25 @@ def train_valorant_agent(
     seed: int = 0,
 ):
     """
-    Train a policy with REINFORCE against a fixed Team2 policy.
+    Train a policy with REINFORCE algorithm.
+    
+    Args:
+        env: ValorantEnv environment (already created with model, etc.)
+        policy: PolicyNet to train
+        episodes: Number of episodes to train for
+        gamma: Discount factor for future rewards
+        lr: Learning rate for optimizer
+        baseline_mode: 'none' or 'mean' (mean reduces variance)
+        seed: Random seed
+    
     Returns:
         episode_returns: list of total rewards per episode
-        policy: trained PolicyNet
+        policy: trained PolicyNet (same object, modified in place)
     """
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    # 1. Create environment vs chosen Team2 strategy
-    env = ValorantEnv(team2_policy=team2_policy_fn)
-
-    # 2. Build policy & optimizer
-    state_dim = len(STATE_KEYS)
-    action_dim = 3
-    policy = PolicyNet(state_dim, action_dim)
+    # Build optimizer for the policy
     optimizer = torch.optim.Adam(policy.parameters(), lr=lr)
 
     episode_returns = []
@@ -835,23 +861,16 @@ def train_valorant_agent(
 
     return episode_returns, policy
 
-if __name__ == "__main__":
-    EPISODES = 200
-    GAMMA = 0.99
-    LR = 1e-3
-
-    # Train vs aggressive Team2 as a first test
-    returns_aggr, policy_aggr = train_valorant_agent(
-        team2_policy_fn=team2_policy_aggressive,
-        episodes=EPISODES,
-        gamma=GAMMA,
-        lr=LR,
-        baseline_mode="mean",
-        seed=42,
-    )
-
-    print("\nTraining finished.")
-    print("First 10 episode returns:", returns_aggr[:10])
-    print("Last 10 episode returns:", returns_aggr[-10:])
+# Training code will be added in next step
+# You can train the agent by calling:
+# returns, trained_policy = train_valorant_agent(env, policy, episodes=300, ...)
 
 # %%
+returns, trained_policy = train_valorant_agent(
+    env, 
+    policy, 
+    episodes=300, 
+    gamma=0.99, 
+    lr=1e-3,
+    baseline_mode="mean"
+)
