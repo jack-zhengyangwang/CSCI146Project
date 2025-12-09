@@ -1,4 +1,5 @@
 # %% Download the dataset
+import numpy as np
 import kagglehub
 import ast
 import os
@@ -71,4 +72,227 @@ acc = accuracy_score(y_test, y_pred)
 
 print("Logistic Regression Accuracy:", acc)
 print(classification_report(y_test, y_pred))
+#%% Team 2 policy
+ACTION_ID_TO_NAME = {
+    0: "eco",
+    1: "semi",
+    2: "full",
+}
+
+def sample_action_from_probs(action_ids, probs, rng=None):
+    """
+    action_ids: list like [0,1,2]
+    probs: list/array of same length, sum to 1
+    rng: optional np.random.Generator
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    return int(rng.choice(action_ids, p=probs))
+
+def team2_policy_aggressive(team2_bank):
+    """
+    Aggressive:
+      - If bank >= 20000: always FULL
+      - Else if bank >= 10000: SEMI (still spending)
+      - Else: ECO
+    """
+    if team2_bank >= 5 * 4200:
+        action_id = 2  # full
+    elif team2_bank >= 10000:
+        action_id = 1  # semi
+    else:
+        action_id = 0  # eco
+
+    return action_id, ACTION_ID_TO_NAME[action_id]
+
+def team2_policy_middle(team2_bank, rng=None):
+    """
+    Middle / balanced strategy:
+      - If bank >= 20000: [eco 0.3, semi 0.4, full 0.3]
+      - If 10000 <= bank < 20000: [eco 0.5, semi 0.5, full 0]
+      - If bank < 10000: [eco 1, semi 0, full 0]
+        """
+    action_ids = [0, 1, 2]
+
+    if team2_bank >= 5 * 4200:
+        probs = [0.3, 0.4, 0.3]
+    elif team2_bank >= 10000:
+        probs = [0.5, 0.5, 0]
+    else:
+        probs = [1, 0, 0]
+
+    action_id = sample_action_from_probs(action_ids, probs, rng)
+    return action_id, ACTION_ID_TO_NAME[action_id]
+
+def team2_policy_conservative(team2_bank, rng=None):
+    """
+    Conservative:
+      - If bank >= 25000: FULL
+      - If 15000 <= bank < 25000: SEMI
+      - If bank < 15000: ECO
+    """
+    if team2_bank >= 30000:
+        action_id = 2  # full
+    elif team2_bank >= 5 * 4200:
+        action_id = 1  # semi
+    else:
+        action_id = 0  # eco
+
+    return action_id, ACTION_ID_TO_NAME[action_id]
+
+
+# %% Econ Rule
+# Core Valorant economy rules (standard comp/unrated) :contentReference[oaicite:0]{index=0}
+# Team-level constants (5 players)
+TEAM_START_CREDITS = 5 * 800      # pistol start
+TEAM_MAX_CREDITS   = 5 * 9000     # soft cap
+
+# Team-level win/loss bonus (5 players * per-player bonus)
+TEAM_WIN_REWARD    = 5 * 3000     # 15000
+TEAM_LOSS_BONUS_1  = 5 * 1900     #  9500
+TEAM_LOSS_BONUS_2  = 5 * 2400     # 12000
+TEAM_LOSS_BONUS_3P = 5 * 2900     # 14500
+
+TEAM_LOSS_BONUSES = [TEAM_LOSS_BONUS_1, TEAM_LOSS_BONUS_2, TEAM_LOSS_BONUS_3P]
+
+# Team-level spend for each buy type (very rough, just pick something consistent)
+BUY_COST_TEAM = {
+    0: 5 * 800,   # eco: everyone does cheap buy
+    1: 5 * 2000,  # semi: everyone spends mid
+    2: 5 * 4200,  # full: everyone fully buys
+}
+
+def team_income(outcome: str, loss_streak_before: int):
+    """
+    outcome: "win" or "loss"
+    loss_streak_before: how many losses in a row before this round
+
+    Returns:
+      income_team (credits), loss_streak_after
+    """
+    outcome = outcome.lower()
+    if outcome == "win":
+        return TEAM_WIN_REWARD, 0
+
+    # loss
+    new_streak = loss_streak_before + 1
+    idx = min(new_streak - 1, 2)  # 0,1,2
+    income = TEAM_LOSS_BONUSES[idx]
+    return income, new_streak
+
+# %% Check game end
+def check_game_end(team1_score, team2_score, win_threshold=13):
+    """
+    Returns True if either team has reached the win threshold.
+    """
+    if team1_score >= win_threshold:
+        return True, "team1"
+    if team2_score >= win_threshold:
+        return True, "team2"
+    return False, None
+
+
 # %%
+class ValorantEnv:
+    def __init__(
+        self,
+        team1_bank_init=4000.0,
+        team2_bank_init=4000.0,
+        team2_policy=team2_policy_aggressive,  # default
+        max_rounds=24,
+        rng_seed=10086,
+    ):
+        self.team1_bank_init = team1_bank_init
+        self.team2_bank_init = team2_bank_init
+        self.team2_policy    = team2_policy
+        self.max_rounds      = max_rounds
+
+        self.rng = np.random.default_rng(rng_seed)
+
+        self.reset()
+
+    def reset(self):
+        """Reset environment to start of game."""
+        self.round_number      = 1
+        self.team1_bank        = self.team1_bank_init
+        self.team2_bank        = self.team2_bank_init
+        self.team1_losestreak  = 0
+        self.team2_losestreak  = 0
+        self.team1_score       = 0
+        self.team2_score       = 0
+
+        state = {
+            "round_number": self.round_number,
+            "team1_bank": self.team1_bank,
+            "team2_bank": self.team2_bank,
+            "team1_losestreak": self.team1_losestreak,
+            "team2_losestreak": self.team2_losestreak,
+            "team1_score": self.team1_score,
+            "team2_score": self.team2_score,
+        }
+        return state
+
+    def step(self, action1):
+        """
+        action1: Team1's buy action (0=eco, 1=semi, 2=full)
+        Team2's action is determined by its fixed policy.
+        """
+        # 1. Team 2 chooses its action based on its bank and fixed strategy
+        action2, action2_name = self.team2_policy(self.team2_bank, rng=self.rng)
+
+        # 2. Decide round outcome
+        # TODO: replace this with your logistic model P(win | state, action1, action2)
+        # For now: pure random 50/50
+        team1_wins = self.rng.random() < 0.5
+
+        # 3. Update score
+        if team1_wins:
+            self.team1_score += 1
+        else:
+            self.team2_score += 1
+
+        ended, winner = check_game_end(self.team1_score, self.team2_score)
+        if ended:
+            done = True
+        else:
+            # otherwise continue until max_rounds
+            self.round_number += 1
+            done = self.round_number > self.max_rounds
+
+        # 3. Update banks (placeholder: you will plug in your bank update function later)
+        # Example structure:
+        #   self.team1_bank, self.team1_losestreak = update_team_bank_simple(
+        #       self.team1_bank, action1,
+        #       outcome="win" if team1_wins else "loss",
+        #       loss_streak_before=self.team1_losestreak
+        #   )
+        #   self.team2_bank, self.team2_losestreak = update_team_bank_simple(
+        #       self.team2_bank, action2,
+        #       outcome="loss" if team1_wins else "win",
+        #       loss_streak_before=self.team2_losestreak
+        #   )
+
+        # 4. Advance round and build next state
+        self.round_number += 1
+        done = self.round_number > self.max_rounds
+
+        next_state = {
+            "round_number": self.round_number,
+            "team1_bank": self.team1_bank,
+            "team2_bank": self.team2_bank,
+            "team1_losestreak": self.team1_losestreak,
+            "team2_losestreak": self.team2_losestreak,
+            "team1_score": self.team1_score,
+            "team2_score": self.team2_score,
+            "team2_action": action2,
+            "team2_action_name": action2_name,
+        }
+
+        info = {
+            "team1_wins": team1_wins,
+            "team2_action": action2,
+            "team2_action_name": action2_name,
+            "game_winner": winner if done else None,
+        }
+
+        return next_state, reward, done, info
