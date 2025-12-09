@@ -324,8 +324,8 @@ def update_team_bank_simple(team_bank_before, action_id, outcome, loss_streak_be
 class ValorantEnv:
     def __init__(
         self,
-        team1_bank_init=4000.0,
-        team2_bank_init=4000.0,
+        team1_bank_init=800.0,
+        team2_bank_init=800.0,
         team2_policy=team2_policy_aggressive,  # default
         max_rounds=24,
         rng_seed=10086,
@@ -579,6 +579,7 @@ print(f"  Initial state: round={test_state['round_number']}, "
 
 
 # %% Step 2: Convert State to Tensor
+print("\n--- Step 2: Convert State to Tensor ---")
 STATE_KEYS = [
     "round_number",
     "team1_bank",
@@ -865,12 +866,81 @@ def train_valorant_agent(
 # You can train the agent by calling:
 # returns, trained_policy = train_valorant_agent(env, policy, episodes=300, ...)
 
-# %%
+# %% Run Algorithm
 returns, trained_policy = train_valorant_agent(
     env, 
     policy, 
-    episodes=300, 
-    gamma=0.99, 
+    episodes=5000, 
+    gamma=0.95, 
     lr=1e-3,
     baseline_mode="mean"
 )
+
+# %% Plot Results
+import matplotlib.pyplot as plt
+
+print("\n" + "="*60)
+print("PLOTTING TRAINING RETURNS")
+print("="*60)
+
+# Create figure with two subplots
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+
+# Plot 1: Raw returns over episodes
+ax1.plot(returns, alpha=0.6, linewidth=0.5, label='Episode Returns', color='blue')
+# Add moving average for smoother visualization
+window_size = 20
+if len(returns) >= window_size:
+    moving_avg = pd.Series(returns).rolling(window=window_size, center=False).mean()
+    ax1.plot(moving_avg, linewidth=2, label=f'Moving Average ({window_size} episodes)', color='red')
+ax1.set_xlabel('Episode')
+ax1.set_ylabel('Total Return')
+ax1.set_title('Training Returns Over Episodes')
+ax1.legend()
+ax1.grid(True, alpha=0.3)
+
+# Plot 2: Distribution of returns (histogram)
+ax2.hist(returns, bins=30, alpha=0.7, edgecolor='black', color='green')
+ax2.axvline(np.mean(returns), color='red', linestyle='--', linewidth=2, 
+            label=f'Mean: {np.mean(returns):.3f}')
+ax2.axvline(np.median(returns), color='orange', linestyle='--', linewidth=2, 
+            label=f'Median: {np.median(returns):.3f}')
+ax2.set_xlabel('Total Return')
+ax2.set_ylabel('Frequency')
+ax2.set_title('Distribution of Episode Returns')
+ax2.legend()
+ax2.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+# Create summary statistics table
+print(f"\n=== Training Summary Statistics ===")
+summary_data = {
+    'Metric': [
+        'Total Episodes',
+        'Mean Return',
+        'Median Return',
+        'Std Deviation',
+        'Min Return',
+        'Max Return',
+        'First 10 Episodes Mean',
+        'Last 10 Episodes Mean',
+        'Improvement (Last 10 - First 10)'
+    ],
+    'Value': [
+        len(returns),
+        f"{np.mean(returns):.4f}",
+        f"{np.median(returns):.4f}",
+        f"{np.std(returns):.4f}",
+        f"{np.min(returns):.4f}",
+        f"{np.max(returns):.4f}",
+        f"{np.mean(returns[:10]):.4f}",
+        f"{np.mean(returns[-10:]):.4f}",
+        f"{np.mean(returns[-10:]) - np.mean(returns[:10]):.4f}"
+    ]
+}
+summary_df = pd.DataFrame(summary_data)
+print(summary_df.to_string(index=False))
+
+# %%
