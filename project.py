@@ -30,12 +30,12 @@ matches    = pd.read_sql_query("SELECT * FROM Matches", conn)
 conn.close()
 
 print("Games columns:", games.columns.tolist())
-# %%
+# %% Create model
 games_model = games.copy()
 
 # y = 1 if Team1 wins, else 0
 games_model["y"] = (games_model["Winner"] == games_model["Team1"]).astype(int)
-# %%
+# %% Create feature
 feature_cols = [
     "Team1_TotalRounds",
     "Team2_TotalRounds",
@@ -54,19 +54,19 @@ games_model = games_model.dropna(subset=feature_cols + ["y"])
 
 X = games_model[feature_cols]
 y = games_model["y"]
-# %%
+# %% Split data
 X_train, X_test, y_train, y_test = train_test_split(
     X, y, test_size=0.2, random_state=42, stratify=y
 )
 
-# %%
+# %% Train model
 scaler = StandardScaler()
 X_train_scaled = scaler.fit_transform(X_train)
 X_test_scaled  = scaler.transform(X_test)
-# %%
+# %% Run Lodistic regression
 logit = LogisticRegression(max_iter=2000)
 logit.fit(X_train_scaled, y_train)
-# %%
+# %% Create prediction and measure accuracy
 y_pred = logit.predict(X_test_scaled)
 acc = accuracy_score(y_test, y_pred)
 
@@ -180,7 +180,7 @@ def team_income(outcome: str, loss_streak_before: int):
     income = TEAM_LOSS_BONUSES[idx]
     return income, new_streak
 
-# %% Check game end
+# %% Helper functions
 def check_game_end(team1_score, team2_score, win_threshold=13):
     """
     Returns True if either team has reached the win threshold.
@@ -191,8 +191,22 @@ def check_game_end(team1_score, team2_score, win_threshold=13):
         return True, "team2"
     return False, None
 
+def update_team_bank_simple(team_bank_before, action_id, outcome, loss_streak_before):
+    """Simplified team credit system with spend + win/loss bonus."""
+    # 1. Spend credits
+    spend = BUY_COST_TEAM[action_id]
+    spend = min(spend, team_bank_before)  # can't spend more than bank
+    bank_after = team_bank_before - spend
 
-# %%
+    # 2. Add income from win/loss (via your function)
+    income, loss_streak_after = team_income(outcome, loss_streak_before)
+    bank_after += income
+
+    # 3. Cap at team max
+    bank_after = min(bank_after, TEAM_MAX_CREDITS)
+
+    return bank_after, loss_streak_after
+# %% Create Valorant Environment
 class ValorantEnv:
     def __init__(
         self,
@@ -232,50 +246,64 @@ class ValorantEnv:
         }
         return state
 
+
     def step(self, action1):
-        """
-        action1: Team1's buy action (0=eco, 1=semi, 2=full)
-        Team2's action is determined by its fixed policy.
-        """
-        # 1. Team 2 chooses its action based on its bank and fixed strategy
+
+        # -------------------------
+        # 1. Team 2 action
+        # -------------------------
         action2, action2_name = self.team2_policy(self.team2_bank, rng=self.rng)
 
-        # 2. Decide round outcome
-        # TODO: replace this with your logistic model P(win | state, action1, action2)
-        # For now: pure random 50/50
+        # -------------------------
+        # 2. Determine round outcome
+        # TODO: replace with logistic model later
+        # -------------------------
         team1_wins = self.rng.random() < 0.5
 
+        outcome1 = "win"  if team1_wins else "loss"
+        outcome2 = "loss" if team1_wins else "win"
+
+        # RL reward
+        reward = 1 if outcome1 == "win" else 0
+
+        # -------------------------
         # 3. Update score
-        if team1_wins:
+        # -------------------------
+        if outcome1 == "win":
             self.team1_score += 1
         else:
             self.team2_score += 1
 
+        # -------------------------
+        # 4. Update banks
+        # -------------------------
+        self.team1_bank, self.team1_losestreak = update_team_bank_simple(
+            team_bank_before   = self.team1_bank,
+            action_id          = action1,
+            outcome            = outcome1,
+            loss_streak_before = self.team1_losestreak
+        )
+
+        self.team2_bank, self.team2_losestreak = update_team_bank_simple(
+            team_bank_before   = self.team2_bank,
+            action_id          = action2,
+            outcome            = outcome2,
+            loss_streak_before = self.team2_losestreak
+        )
+
+        # -------------------------
+        # 5. Game-end check
+        # -------------------------
         ended, winner = check_game_end(self.team1_score, self.team2_score)
         if ended:
             done = True
         else:
-            # otherwise continue until max_rounds
             self.round_number += 1
-            done = self.round_number > self.max_rounds
+            done = (self.round_number > self.max_rounds)
 
-        # 3. Update banks (placeholder: you will plug in your bank update function later)
-        # Example structure:
-        #   self.team1_bank, self.team1_losestreak = update_team_bank_simple(
-        #       self.team1_bank, action1,
-        #       outcome="win" if team1_wins else "loss",
-        #       loss_streak_before=self.team1_losestreak
-        #   )
-        #   self.team2_bank, self.team2_losestreak = update_team_bank_simple(
-        #       self.team2_bank, action2,
-        #       outcome="loss" if team1_wins else "win",
-        #       loss_streak_before=self.team2_losestreak
-        #   )
-
-        # 4. Advance round and build next state
-        self.round_number += 1
-        done = self.round_number > self.max_rounds
-
+        # -------------------------
+        # 6. Build next state
+        # -------------------------
         next_state = {
             "round_number": self.round_number,
             "team1_bank": self.team1_bank,
@@ -289,7 +317,7 @@ class ValorantEnv:
         }
 
         info = {
-            "team1_wins": team1_wins,
+            "team1_wins_round": team1_wins,
             "team2_action": action2,
             "team2_action_name": action2_name,
             "game_winner": winner if done else None,
