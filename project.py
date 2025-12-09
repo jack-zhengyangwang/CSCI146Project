@@ -9,6 +9,10 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report
+import torch.nn as nn
+import torch
+from torch.distributions import Categorical
+from typing import List
 
 # Download latest version
 path = kagglehub.dataset_download("visualize25/valorant-pro-matches-full-data")
@@ -89,7 +93,7 @@ def sample_action_from_probs(action_ids, probs, rng=None):
         rng = np.random.default_rng()
     return int(rng.choice(action_ids, p=probs))
 
-def team2_policy_aggressive(team2_bank):
+def team2_policy_aggressive(team2_bank, rng=None):
     """
     Aggressive:
       - If bank >= 20000: always FULL
@@ -324,3 +328,266 @@ class ValorantEnv:
         }
 
         return next_state, reward, done, info
+
+# %% Convet State to Tensor
+import torch
+STATE_KEYS = [
+    "round_number",
+    "team1_bank",
+    "team2_bank",
+    "team1_losestreak",
+    "team2_losestreak",
+    "team1_score",
+    "team2_score"
+]
+
+def state_to_tensor(state: dict) -> torch.Tensor:
+    """
+    Convert the environment state dict into a 1D float tensor.
+    Only includes variables listed in STATE_KEYS.
+    """
+    vals = []
+    for key in STATE_KEYS:
+        vals.append(float(state[key]))   # ensure numeric
+    return torch.tensor(vals, dtype=torch.float32)
+
+# Test
+# state = {
+#     "round_number": 4,
+#     "team1_bank": 8000,
+#     "team2_bank": 12000,
+#     "team1_losestreak": 1,
+#     "team2_losestreak": 0,
+#     "team1_score": 3,
+#     "team2_score": 2,
+# }
+# print(state_to_tensor(state))
+# %% Create Policy
+class PolicyNet(nn.Module):
+    def __init__(self, state_dim: int, action_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, action_dim),
+            nn.Softmax(dim=-1),
+        )
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        """
+        Input:
+            state: shape [state_dim]
+
+        Output:
+            action probabilities: shape [action_dim], sum to 1
+        """
+        return self.net(state)
+
+#state_dim = len(STATE_KEYS)
+#action_dim = 3
+
+#policy = PolicyNet(state_dim, action_dim)
+
+#dummy_state = torch.tensor([1.0, 40000.0, 40000.0, 0.0, 1.0, 3.0, 4.0])
+
+# print(policy(dummy_state))
+
+
+# %% Run on episode
+def run_one_episode(env: ValorantEnv, policy: PolicyNet):
+    """
+    Play one full game (episode) using the current policy.
+    
+    Returns:
+        rewards:  list of rewards per step (round)
+        logps:    list of log π(a_t|s_t) per step (PyTorch tensors)
+        total_return: sum of rewards in the episode
+    """
+    state = env.reset()
+    done = False
+
+    rewards = []
+    logps   = []
+
+    while not done:
+        # 1. Convert state dict -> tensor
+        s_t = state_to_tensor(state)     # shape [state_dim]
+
+        # 2. Get action probs from policy
+        probs = policy(s_t)              # shape [3] = [p_eco, p_semi, p_full]
+
+        # 3. Define a categorical distribution and sample an action
+        dist = Categorical(probs)
+        action = dist.sample()           # scalar {0,1,2}
+        logp = dist.log_prob(action)     # log π(a_t|s_t), scalar tensor
+
+        # 4. Step the environment with Team1's action
+        next_state, reward, done, info = env.step(action.item())
+
+        # 5. Store reward and log-prob
+        rewards.append(float(reward))
+        logps.append(logp)
+
+        # 6. Move to next state
+        state = next_state
+
+    total_return = sum(rewards)
+    return rewards, logps, total_return
+
+if __name__ == "__main__":
+    # 1. Build environment vs some fixed Team2 strategy
+    env = ValorantEnv(team2_policy=team2_policy_aggressive)
+
+    # 2. Build randomly initialized policy
+    state_dim = len(STATE_KEYS)
+    action_dim = 3
+    policy = PolicyNet(state_dim, action_dim)
+
+    # 3. Run one episode
+    rewards, logps, total_return = run_one_episode(env, policy)
+
+    print("Number of rounds played:", len(rewards))
+    print("Total return (sum of rewards):", total_return)
+    print("First few rewards:", rewards[:10])
+
+# %% Discounted Return
+def discounted_returns(rewards: List[float], gamma: float = 0.99) -> torch.Tensor:
+    """
+    Compute discounted returns G_t for a single episode:
+        G_t = r_t + gamma * r_{t+1} + ...
+    Input:
+        rewards: list of rewards [r_0, ..., r_{T-1}]
+    Output:
+        torch.Tensor of shape [T]
+    """
+    G = []
+    running = 0.0
+    for r in reversed(rewards):
+        running = r + gamma * running
+        G.append(running)
+    G.reverse()
+    return torch.tensor(G, dtype=torch.float32)
+
+# %%
+def run_one_episode(env: ValorantEnv, policy: PolicyNet):
+    """
+    Play one full game (episode) using the current policy.
+    
+    Returns:
+        rewards:  list of rewards per step (round)
+        logps:    list of log π(a_t|s_t) per step (PyTorch tensors)
+        total_return: sum of rewards in the episode
+    """
+    state = env.reset()
+    done = False
+
+    rewards = []
+    logps   = []
+
+    while not done:
+        # 1. Convert state dict -> tensor
+        s_t = state_to_tensor(state)     # shape [state_dim]
+
+        # 2. Get action probs from policy
+        probs = policy(s_t)              # shape [3] = [p_eco, p_semi, p_full]
+
+        # 3. Define a categorical distribution and sample an action
+        dist = Categorical(probs)
+        action = dist.sample()           # scalar {0,1,2}
+        logp = dist.log_prob(action)     # log π(a_t|s_t), scalar tensor
+
+        # 4. Step the environment with Team1's action
+        next_state, reward, done, info = env.step(action.item())
+
+        # 5. Store reward and log-prob
+        rewards.append(float(reward))
+        logps.append(logp)
+
+        # 6. Move to next state
+        state = next_state
+
+    total_return = sum(rewards)
+    return rewards, logps, total_return
+
+def train_valorant_agent(
+    team2_policy_fn,
+    episodes: int = 300,
+    gamma: float = 0.99,
+    lr: float = 1e-3,
+    baseline_mode: str = "mean",  # 'none' or 'mean'
+    seed: int = 0,
+):
+    """
+    Train a policy with REINFORCE against a fixed Team2 policy.
+    Returns:
+        episode_returns: list of total rewards per episode
+        policy: trained PolicyNet
+    """
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    # 1. Create environment vs chosen Team2 strategy
+    env = ValorantEnv(team2_policy=team2_policy_fn)
+
+    # 2. Build policy & optimizer
+    state_dim = len(STATE_KEYS)
+    action_dim = 3
+    policy = PolicyNet(state_dim, action_dim)
+    optimizer = torch.optim.Adam(policy.parameters(), lr=lr)
+
+    episode_returns = []
+
+    for ep in range(episodes):
+        # ---- Roll out one episode ----
+        rewards, logps, total_return = run_one_episode(env, policy)
+
+        # ---- Convert to tensors ----
+        logps_t = torch.stack(logps)             # shape [T]
+        G = discounted_returns(rewards, gamma)   # shape [T]
+
+        # ---- Baseline (variance reduction) ----
+        if baseline_mode == "none":
+            advantages = G
+        elif baseline_mode == "mean":
+            advantages = G - G.mean()
+        else:
+            raise ValueError("baseline_mode must be 'none' or 'mean'.")
+
+        # ---- REINFORCE loss: -sum_t A_t * log π(a_t|s_t) ----
+        loss = -(logps_t * advantages).sum()
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        episode_returns.append(total_return)
+
+        if (ep + 1) % 10 == 0:
+            recent_mean = np.mean(episode_returns[-10:])
+            print(
+                f"[{baseline_mode}] Episode {ep+1:4d} | "
+                f"mean return (last 10) = {recent_mean:6.3f}"
+            )
+
+    return episode_returns, policy
+
+if __name__ == "__main__":
+    EPISODES = 200
+    GAMMA = 0.99
+    LR = 1e-3
+
+    # Train vs aggressive Team2 as a first test
+    returns_aggr, policy_aggr = train_valorant_agent(
+        team2_policy_fn=team2_policy_aggressive,
+        episodes=EPISODES,
+        gamma=GAMMA,
+        lr=LR,
+        baseline_mode="mean",
+        seed=42,
+    )
+
+    print("\nTraining finished.")
+    print("First 10 episode returns:", returns_aggr[:10])
+    print("Last 10 episode returns:", returns_aggr[-10:])
+
+# %%
