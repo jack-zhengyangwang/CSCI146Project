@@ -19,6 +19,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report
+from sklearn.decomposition import PCA
 import torch.nn as nn
 import torch
 from torch.distributions import Categorical
@@ -77,20 +78,60 @@ def get_team1_win(row):
     
     RoundWinner is like "BOOS" or "PHO " (team abbreviations)
     We need to match it to Team1's name to create binary: 1 = Team1 won, 0 = Team2 won
+    
+    Note: This function should match the logic in clean_rounds.py's winner_matches_team function.
+    However, clean_rounds.py now pre-calculates _Team1Wins, so this is only used as a fallback.
     """
-    if pd.isna(row['RoundWinner']):
+    if pd.isna(row.get('RoundWinner', None)) or pd.isna(row.get('Team1', None)):
         return None
-    round_winner = str(row['RoundWinner']).strip().upper()
+    round_winner = str(row['RoundWinner']).strip()
     team1_name = str(row.get('Team1', '')).strip() if pd.notna(row.get('Team1')) else ''
     
-    if team1_name:
-        # Create abbreviation from team name (first letters of each word)
-        team1_abbrev = ''.join([w[0] for w in team1_name.split()]).upper()[:4]
-        if round_winner.startswith(team1_abbrev) or team1_abbrev.startswith(round_winner):
-            return 1
+    if not team1_name:
+        return 0
+    
+    # Use the same matching logic as clean_rounds.py's winner_matches_team
+    winner_upper = round_winner.upper()
+    team_upper = team1_name.upper()
+    
+    # Try exact match
+    if winner_upper == team_upper:
+        return 1
+    
+    # Try abbreviation match (first letters of each word)
+    team_abbrev = ''.join([w[0] for w in team1_name.split()]).upper()[:4]
+    if team_abbrev and (winner_upper.startswith(team_abbrev) or team_abbrev.startswith(winner_upper)):
+        return 1
+    
+    # Try substring match
+    if winner_upper in team_upper or team_upper in winner_upper:
+        return 1
+    
     return 0
 
-rounds_cleaned['Team1_WinsRound'] = rounds_cleaned.apply(get_team1_win, axis=1)
+# Use pre-calculated winner if available (from clean_rounds.py swapping), otherwise calculate
+# clean_rounds.py now creates _Team1Wins after swapping teams, which should be balanced
+if '_Team1Wins' in rounds_cleaned.columns:
+    print("Using pre-calculated Team1_WinsRound from clean_rounds.py (includes swapped rows)")
+    print(f"  _Team1Wins distribution: {rounds_cleaned['_Team1Wins'].value_counts().to_dict()}")
+    rounds_cleaned['Team1_WinsRound'] = rounds_cleaned['_Team1Wins']
+    # Drop the helper column
+    rounds_cleaned = rounds_cleaned.drop(columns=['_Team1Wins'])
+elif '_OriginalTeam1Wins' in rounds_cleaned.columns:
+    # Legacy support for old column name
+    print("Using pre-calculated Team1_WinsRound from clean_rounds.py (legacy column name)")
+    print(f"  _OriginalTeam1Wins distribution: {rounds_cleaned['_OriginalTeam1Wins'].value_counts().to_dict()}")
+    rounds_cleaned['Team1_WinsRound'] = rounds_cleaned['_OriginalTeam1Wins']
+    rounds_cleaned = rounds_cleaned.drop(columns=['_OriginalTeam1Wins'])
+else:
+    print("Calculating Team1_WinsRound using get_team1_win function")
+    rounds_cleaned['Team1_WinsRound'] = rounds_cleaned.apply(get_team1_win, axis=1)
+
+# Check distribution after calculating Team1_WinsRound
+print("\n=== Team1_WinsRound Distribution (before dropping missing values) ===")
+print(rounds_cleaned['Team1_WinsRound'].value_counts().sort_index())
+print(f"Total rows: {len(rounds_cleaned)}")
+print(f"Missing/None values: {rounds_cleaned['Team1_WinsRound'].isna().sum()}")
 
 # Recommended feature columns for round-level prediction:
 round_feature_cols = [
@@ -162,7 +203,15 @@ X_test_scaled = scaler.transform(X_test)
 
 # %% Run Logistic regression
 print("\n=== Training Logistic Regression Model ===")
-logit = LogisticRegression(max_iter=2000, random_state=42)
+
+# Calculate class weights to handle imbalance
+from sklearn.utils.class_weight import compute_class_weight
+classes = np.unique(y_train)
+class_weights = compute_class_weight('balanced', classes=classes, y=y_train)
+class_weight_dict = dict(zip(classes, class_weights))
+print(f"Class weights: {class_weight_dict}")
+
+logit = LogisticRegression(max_iter=2000, random_state=42, class_weight='balanced')
 logit.fit(X_train_scaled, y_train)
 
 # Store feature names for environment
@@ -185,6 +234,70 @@ feature_importance = pd.DataFrame({
 }).sort_values('Coefficient', ascending=False)
 
 print(feature_importance.to_string(index=False))
+
+# %% Feature Visualization (2 Most Important Features)
+print("\n=== Feature Visualization (2 Most Important Features) ===")
+import matplotlib.pyplot as plt
+
+# Identify binary/categorical features (these create horizontal/vertical lines when plotted)
+binary_features = ['Team1_IsEco', 'Team1_IsSemi', 'Team1_IsFull', 
+                   'Team2_IsEco', 'Team2_IsSemi', 'Team2_IsFull',
+                   'IsEarlyGame', 'IsMidGame', 'IsLateGame']
+
+# Get the two most important CONTINUOUS features (exclude binary features)
+top_features = feature_importance.copy()
+top_features['AbsCoefficient'] = top_features['Coefficient'].abs()
+# Filter out binary features for better visualization
+continuous_features = top_features[~top_features['Feature'].isin(binary_features)]
+continuous_features = continuous_features.sort_values('AbsCoefficient', ascending=False)
+
+if len(continuous_features) < 2:
+    print("Warning: Not enough continuous features. Using top 2 features regardless of type.")
+    top_features = top_features.sort_values('AbsCoefficient', ascending=False)
+    feature1_name = top_features.iloc[0]['Feature']
+    feature2_name = top_features.iloc[1]['Feature']
+else:
+    feature1_name = continuous_features.iloc[0]['Feature']
+    feature2_name = continuous_features.iloc[1]['Feature']
+
+print(f"Selected features for visualization (continuous features only):")
+print(f"  X-axis: {feature1_name} (coefficient: {top_features[top_features['Feature']==feature1_name].iloc[0]['Coefficient']:.4f})")
+print(f"  Y-axis: {feature2_name} (coefficient: {top_features[top_features['Feature']==feature2_name].iloc[0]['Coefficient']:.4f})")
+print(f"\nNote: Binary features (like Team1_IsEco) were excluded as they create horizontal/vertical lines.")
+
+# Get indices of the features in the feature array
+feature1_idx = available_features.index(feature1_name)
+feature2_idx = available_features.index(feature2_name)
+
+# Extract the two features from scaled training data
+feature1_values = X_train_scaled[:, feature1_idx]
+feature2_values = X_train_scaled[:, feature2_idx]
+
+# Create scatter plot
+fig, ax = plt.subplots(figsize=(12, 8))
+
+# Separate wins and losses
+wins_mask = y_train == 1
+losses_mask = y_train == 0
+
+# Plot wins (circles) and losses (triangles)
+ax.scatter(feature1_values[wins_mask], feature2_values[wins_mask], 
+           c='green', marker='o', s=20, alpha=0.5, label='Team1 Wins (1)', edgecolors='darkgreen', linewidths=0.5)
+ax.scatter(feature1_values[losses_mask], feature2_values[losses_mask], 
+           c='red', marker='^', s=20, alpha=0.5, label='Team1 Losses (0)', edgecolors='darkred', linewidths=0.5)
+
+# Label axes with feature names
+ax.set_xlabel(feature1_name, fontsize=12, fontweight='bold')
+ax.set_ylabel(feature2_name, fontsize=12, fontweight='bold')
+ax.set_title('Team1 Win/Loss Classification\n(2 Most Important Features)', 
+             fontsize=14, fontweight='bold')
+ax.legend(loc='best', fontsize=10)
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+print("\nFeature visualization complete!")
 
 #%% Team 2 policy
 ACTION_ID_TO_NAME = {
